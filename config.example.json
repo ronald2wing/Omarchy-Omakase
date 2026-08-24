@@ -1,0 +1,5 @@
+{
+  "home": { "lat": 0.0, "lon": 0.0, "city": "" },
+  "radiusKm": 10,
+  "refreshIntervalSec": 3600
+}

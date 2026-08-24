@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "omakase",
+  "name": "Omakase",
+  "version": "0.1.0",
+  "author": "ronald2wing",
+  "license": "MIT",
+  "description": "Chef's-choice meal planning: a daily meal plan you rate or decline, with a personal journal that sharpens future picks and per-cuisine drink pairings.",
+  "homepage": "https://github.com/ronald2wing/Omarchy-Omakase",
+  "repository": "https://github.com/ronald2wing/Omarchy-Omakase",
+  "kinds": ["service", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omakase",
+    "description": "What should I eat?",
+    "category": "Food",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

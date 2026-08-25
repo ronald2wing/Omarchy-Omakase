@@ -27,6 +27,7 @@ Item {
   property var drinks: []
   property string lastError: ""
   property bool locatedOnce: false
+  property bool firstRun: false
   property var lastUndo: null
 
   // A rate/decline can be undone within this window.
@@ -164,6 +165,16 @@ Item {
       return;
     }
     applyCache(kind, outText);
+    // On first install only, seed an initial plan once candidates are available
+    // and today's plan is empty. Subsequent startups leave an empty plan alone
+    // until the next midnight rollover (see refreshTimer).
+    if (firstRun && (restaurants.length > 0 || recipes.length > 0)) {
+      if (plan.length === 0 || !plan[0].meals || plan[0].meals.length === 0) {
+        generatePlan("day");
+      }
+      markerFile.setText("1\n");
+      firstRun = false;
+    }
     if (lastError !== "") {
       lastError = "";
       writeState();
@@ -196,7 +207,7 @@ Item {
 
   function generatePlan(period) {
     var p = period || "day";
-    if (p === "day" && plan.length > 0 && plan[0].date === todayStr()) {
+    if (p === "day" && plan.length > 0 && plan[0].date === todayStr() && plan[0].meals && plan[0].meals.length > 0) {
       return "ok"; // sticky: keep today's plan, do not re-scramble
     }
     buildPlan(p);
@@ -204,7 +215,8 @@ Item {
   }
 
   function todayStr() {
-    return new Date().toISOString().slice(0, 10);
+    var d = new Date();
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
   }
 
   function buildPlan(period) {
@@ -402,6 +414,18 @@ Item {
     onFileChanged: reload()
   }
 
+  // First-install marker: absent on the very first run, present afterwards.
+  // Its presence gates the one-time plan seeding in handleFetch.
+  FileView {
+    id: markerFile
+    path: root.stateDir + "/.initialized"
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.firstRun = false
+    onLoadFailed: root.firstRun = true
+  }
+
   // The bin/ fetch scripts write the cache files; the service only reads them
   // back through these watchers, so there is one per catalog kind.
   Instantiator {
@@ -431,7 +455,15 @@ Item {
     repeat: true
     running: true
     triggeredOnStart: true
-    onTriggered: root.refresh()
+    onTriggered: {
+      root.refresh();
+      // Regenerate the plan only when the day rolls over (local midnight) — a
+      // fresh plan for the new day. Empty plans are filled immediately at
+      // startup (see handleFetch), not on this timer.
+      if (plan.length > 0 && plan[0].date !== todayStr()) {
+        root.generatePlan("day");
+      }
+    }
   }
 
   Timer {

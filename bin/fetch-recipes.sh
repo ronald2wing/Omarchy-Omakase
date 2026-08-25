@@ -14,7 +14,7 @@ fi
 
 require_curl
 
-resp=$(curl -sS --max-time 25 -G "https://www.themealdb.com/api/json/v1/1/search.php" --data-urlencode "s=$query" 2>/dev/null) || {
+resp=$(curl -sS --max-time 25 --max-filesize 5242880 -G "https://www.themealdb.com/api/json/v1/1/search.php" --data-urlencode "s=$query" 2>/dev/null) || {
   echo "themealdb request failed"
   exit 1
 }

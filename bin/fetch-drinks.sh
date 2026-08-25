@@ -10,7 +10,7 @@ require_curl
 tmp=$(mktemp)
 fetch_ok=1
 for category in Cocktail Ordinary_Drink; do
-  curl -sS --max-time 25 -G "https://www.thecocktaildb.com/api/json/v1/1/filter.php" --data-urlencode "c=$category" 2>/dev/null >> "$tmp" || fetch_ok=0
+  curl -sS --max-time 25 --max-filesize 5242880 -G "https://www.thecocktaildb.com/api/json/v1/1/filter.php" --data-urlencode "c=$category" 2>/dev/null >> "$tmp" || fetch_ok=0
 done
 
 if (( fetch_ok == 0 )); then

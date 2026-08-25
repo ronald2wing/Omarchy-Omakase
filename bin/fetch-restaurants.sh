@@ -33,7 +33,7 @@ else
   q="[out:json][timeout:25];(nwr[\"amenity\"=\"restaurant\"](around:${radiusMeters},${lat},${lon}););out center;"
 fi
 
-resp=$(curl -sS --max-time 25 -G "https://overpass-api.de/api/interpreter" --data-urlencode "data=$q" 2>/dev/null) || {
+resp=$(curl -sS --max-time 25 --max-filesize 10485760 -G "https://overpass-api.de/api/interpreter" --data-urlencode "data=$q" 2>/dev/null) || {
   echo "overpass request failed"
   exit 1
 }
@@ -41,7 +41,7 @@ resp=$(curl -sS --max-time 25 -G "https://overpass-api.de/api/interpreter" --dat
 # The main endpoint returns an HTML error page (HTTP 200) when busy. Retry
 # against a mirror before giving up, and never clobber a good cache.
 if ! printf '%s' "$resp" | jq -e '.elements' >/dev/null 2>&1; then
-  resp=$(curl -sS --max-time 25 -G "https://overpass.kumi.systems/api/interpreter" --data-urlencode "data=$q" 2>/dev/null) || {
+  resp=$(curl -sS --max-time 25 --max-filesize 10485760 -G "https://overpass.kumi.systems/api/interpreter" --data-urlencode "data=$q" 2>/dev/null) || {
     echo "overpass request failed"
     exit 1
   }

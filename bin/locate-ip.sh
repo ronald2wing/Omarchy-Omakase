@@ -6,7 +6,7 @@ source "$SCRIPT_DIR/lib.sh"
 
 require_curl
 
-resp=$(curl -sS --max-time 15 "https://ipwho.is/" 2>/dev/null) || {
+resp=$(curl -sS --max-time 15 --max-filesize 1048576 "https://ipwho.is/" 2>/dev/null) || {
   echo "ipwhois request failed"
   exit 1
 }

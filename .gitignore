@@ -1,3 +1,30 @@
+# --- Agent steering (kept local; a git-clone install never ships it) ---
+AGENTS.md
+
+# --- Secrets (`.env.example` is the committed template) ---
+.env
+.env.*
+.envrc
+!.env.example
+
+# --- Pipeline resume markers: regenerated, never committed ---
+.*-progress*
+
+# --- Editor / OS cruft ---
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.code-workspace
+
+# --- Transient / build artifacts (atomic-write temps, compiled caches) ---
 *.qmlc
 *.jsc
-node_modules/
+*.bak
+*.tmp
+*.orig
+*.log
+*.rej

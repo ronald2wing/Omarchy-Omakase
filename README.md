@@ -1,113 +1,110 @@
 # Omakase
 
-Chef's-choice meal planning for the Omarchy desktop shell.
-<https://github.com/ronald2wing/Omarchy-Omakase>
+A worldwide omakase (sushi) directory and sushi-spot tracker for the Omarchy
+desktop shell. Browse 5,016 spots across 65 cities, sorted by distance from
+home; search and filter by city, state, country, and neighborhood; rate what
+you try and keep a journal.
 
-Omakase picks your meals so you don't have to. The panel shows today's plan —
-breakfast, lunch, and dinner — each meal with a cuisine, a one-line blurb, and a
-"pairs with" drink. Rate a meal 1–5 or decline it, and add an optional note.
-Every rating, decline, and note is logged to a journal that sharpens the scoring
-behind every future plan. A history view lists past meals, and a copy-to-share
-button turns any meal into a one-line summary for the clipboard.
+Two plugin kinds work together:
 
-## How it works
+- **Service** (`Service.qml`) — headless. Loads the seed directory, owns the
+  persistent state and the IPC surface.
+- **Bar widget** (`BarWidget.qml`) — the panel UI. Reads state from files and
+  sends rate/unrate actions to the service over IPC.
 
-- **Service** (`Service.qml`) runs headless and owns the IPC handler. It loads
-  config, fetches candidate restaurants, recipes, and drinks, scores them, and
-  writes state to `~/.local/state/omakase/`.
-- **Panel** (`BarWidget.qml`) is file-driven: it reads `state.json` and renders
-  the plan grouped by meal type. Actions (rate, decline, undo) go over IPC; the
-  panel never reads state over IPC.
-- **Scoring** (`Model.js`) is pure logic, unit-tested under Node, weighing
-  recency, declines, cuisine variety, time of day, distance, your past ratings,
-  cuisine affinity, and the sentiment of your notes.
+## Requirements
 
-The daily plan is sticky: it only regenerates when the day rolls over or when
-you rate or decline a meal. Declined meals are remembered and avoided for a
-while.
-
-## Keyless data sources
-
-No API keys required — only `curl` and `jq`:
-
-- **Restaurants** — OpenStreetMap's Overpass API (nearby, ranked by distance).
-- **Recipes** — TheMealDB.
-- **Drinks** — TheCocktailDB.
-- **Location** — ipwho.is IP geolocation on first run.
+- Omarchy (a Quickshell-based shell).
+- Omarchy's weather plugin configured with a location. Omakase reads the
+  weather plugin's coordinates to compute distance from home; without them,
+  distance sorting and the radius filter do nothing.
 
 ## Install
 
-```bash
-omarchy plugin add https://github.com/ronald2wing/Omarchy-Omakase --enable
-```
-
-Then restart the shell: `omarchy-restart-shell`.
-
-## Remove
+From the Omarchy plugin marketplace, or from the repository:
 
 ```bash
-omarchy plugin remove omakase
+omarchy plugin add https://github.com/ronald2wing/Omarchy-Omakase.git --enable
 ```
 
-## Config
+Add `--yes` to skip the confirmation prompt.
 
-`~/.config/omakase/config.json`:
+The shell loads the installed copy from `~/.config/omarchy/plugins/omakase/`.
+After installing or updating, restart the shell — hot-reload is not relied on:
 
-```json
-{
-  "home": { "lat": 51.5074, "lon": -0.1278, "city": "London" },
-  "radiusKm": 10,
-  "refreshIntervalSec": 3600
-}
+```bash
+omarchy-restart-shell
 ```
 
-- `home` — your location (`lat`/`lon`/`city`). Leave at `(0,0)` to auto-detect
-  from your IP on first run.
-- `radiusKm` — restaurant search radius.
-- `refreshIntervalSec` — catalog refresh interval (min 60s).
+Do not run two shell instances at once. Confirm the service is up:
+
+```bash
+omarchy-shell omakase ping
+# ok
+```
+
+## Using the panel
+
+The panel has three tabs:
+
+| Tab | What it does |
+| --- | --- |
+| **Explore** | Browse every spot in the directory. Search, filter, sort, or tap **Surprise me** for a random pick. |
+| **Wishlist** | Spots you saved. Tap the heart on any spot to pin it here. |
+| **Journal** | Every spot you have rated. Open an entry to update the rating or notes, or remove it. |
+
+### Filters
+
+The primary filter row sits under the search field:
+
+- **Type** — All / Omakase / Discount.
+- **Unrated** — hide spots you have already rated.
+- **Nearby** — cycles the radius (see [Radius](#radius)).
+- **Filters** — opens a sheet with the location scopes: **City**, **State**
+  (US two-letter code; Yelp region codes for non-US cities are ignored),
+  **Country** (as reported by Yelp), and **Neighborhood** (appears once a city
+  with neighborhoods is selected). The sheet has its own **Clear all**.
+
+When any filter is active, a summary line lists each as a clickable token that
+removes that filter, plus a **Clear all** button that resets every filter.
+
+### Sort
+
+The sort chip cycles **Distance → Rating → Price**. Tap the trailing arrow to
+reverse the order. Distance sorts nearest-first, rating highest-first. Price
+sorts by the numeric price; discount spots with no numeric price sort cheapest,
+and non-discount spots with no numeric price fall back to their Yelp price
+bucket (`$` → 10 through `$$$$` → 40). Unpriced spots sort last, and equal
+prices tie-break by rating, then review count, then name.
+
+### Radius
+
+The **Nearby** pill cycles off → 5 km → 10 km → 20 km; an active radius reads
+**Within 10 km**. Setting a radius clears
+the location scopes (city, state, country, neighborhood) so the list is built
+around your home location; the radius itself is preserved. Distance is
+straight-line (haversine) kilometres.
+
+### Rating
+
+Opening a spot shows the rating form: tap the stars, add notes, then save. The
+buttons are **Save** and **Remove** (the latter only when a rating exists). A
+rating or removal can be undone within five minutes via the service's `undo`
+method.
+
+### Home location
+
+Distance sorting, the radius filter, and the home-to-city distance display all
+use the home coordinates from the Omarchy weather plugin. Set your location in
+the weather panel; Omakase watches its settings file and picks up changes.
 
 ## Data
 
-All state lives outside the plugin directory under
-`~/.local/state/omakase/`:
-
-- `state.json` — snapshot the panel reads (plan, journal, last error, …).
-- `journal.json` — your rated/declined meal history.
-- `plan.json` — the current plan.
-- `undo.json` — the last undoable action.
-- `cache/` — cached restaurant/recipe/drink catalogs.
-
-## IPC
-
-All commands target the plugin id `omakase`:
-
-```bash
-omarchy-shell omakase <method> [args...]
-```
-
-| Method | Args | Purpose |
-| --- | --- | --- |
-| `ping` | | liveness check |
-| `refresh` | | re-fetch all catalogs |
-| `generatePlan` | `day`\|`week` | build a plan (defaults to `day`) |
-| `rate` | `id`, `1-5`, `[notes]` | rate a planned meal |
-| `decline` | `id`, `[notes]` | decline a planned meal |
-| `undo` | | undo the last rate/decline (5-min window) |
-| `searchRestaurants` | `query` | re-fetch restaurants filtered by name |
-| `searchRecipes` | `query` | fetch recipes matching a query |
-| `setHome` | `lat`, `lon` | set the home location |
-| `locateIp` | | geolocate home from your IP |
-| `addMeal` | `json` | add a journal entry |
-| `removeMeal` | `id` | remove a journal entry |
-
-Example:
-
-```bash
-omarchy-shell omakase setHome 51.5074 -0.1278
-omarchy-shell omakase generatePlan day
-omarchy-shell omakase rate rest-123 4 "great pizza"
-```
+Omakase ships a worldwide directory — one `data/<city>.jsonl` file per city,
+one spot per line. State is kept outside the plugin directory, under
+`~/.local/state/omakase/`. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+schema, how to add a spot or city, and how to verify a change.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT

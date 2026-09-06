@@ -1,526 +1,489 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
-import "Model.js" as M
+import "lib/spot-utils.js" as SpotUtils
+import "lib/journal-identity.js" as JournalIdentity
+import "components"
 
+// Omakase — worldwide sushi directory.
+// Service kind: loads seed data, watches the weather-plugin location,
+// and owns all state + IPC. BarWidget reads state via FileView (never IPC).
 Item {
   id: root
   property var manifest: null
-
   readonly property string pluginId: "omakase"
-  readonly property string home: Quickshell.env("HOME")
-  readonly property string configDir: home + "/.config/" + pluginId
-  readonly property string configPath: configDir + "/config.json"
-  readonly property string stateDir: home + "/.local/state/" + pluginId
-  readonly property string statePath: stateDir + "/state.json"
-  readonly property string journalPath: stateDir + "/journal.json"
-  readonly property string planPath: stateDir + "/plan.json"
+
+  readonly property string homeDir: String(Quickshell.env("HOME"))
+  readonly property string stateDir: homeDir + SpotUtils.STATE_DIR_SUFFIX
+  readonly property string statePath: stateDir + "/" + SpotUtils.STATE_FILE
+  readonly property string journalPath: stateDir + "/" + SpotUtils.JOURNAL_FILE
+  readonly property string userSpotsPath: stateDir + "/user_spots.json"
   readonly property string undoPath: stateDir + "/undo.json"
-  readonly property string cacheDir: stateDir + "/cache"
-  readonly property string sourceDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : home + "/.config/omarchy/plugins/" + pluginId
+  readonly property string sourceDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : homeDir + "/.config/omarchy/plugins/" + pluginId
 
-  property var config: ({ home: { lat: 0, lon: 0, city: "" }, radiusKm: 10, refreshIntervalSec: 3600 })
-  property var journal: []
-  property var plan: []
-  property var restaurants: []
-  property var recipes: []
-  property var drinks: []
-  property string lastError: ""
-  property bool locatedOnce: false
-  property bool firstRun: false
-  property var lastUndo: null
+  property double homeLat: 0
+  property double homeLon: 0
+  // Coordinates last written to state.json — the baseline persistHomeIfChanged
+  // compares each fresh home read against, so an unchanged home never burns a
+  // full rewrite.
+  property double persistedHomeLat: 0
+  property double persistedHomeLon: 0
+  // The homeSource value last written to state.json — the baseline
+  // persistHomeIfChanged compares against, so a source-only change (same
+  // coords, different source) is still persisted and a no-op change isn't.
+  property string persistedHomeSource: ""
+  // Which source produced homeLat/homeLon: "weather" (user's weather-plugin
+  // location, authoritative), "tz" (offline timezone approximation, auto and
+  // re-derivable), or "" (none). Persisted so a restart can tell user-set
+  // from auto and later stages can upgrade an auto value.
+  property string homeSource: ""
+  // state.json read finished (parsed, missing, or oversized). Gates the fallback.
+  property bool stateLoaded: false
+  // Weather-file outcome: "" until read, then "valid" (usable coordinates),
+  // "missing" (file absent — Omarchy's "auto" mode), or "broken" (oversized/
+  // garbled). Missing re-derives and may replace a known home; broken keeps it.
+  property string weatherState: ""
+  // One tz probe at a time; a second change while running is dropped (result is
+  // a pure function of the system tz).
+  property bool tzRunning: false
+  // The catalog is in memory this session (seeded from data/*.jsonl, or reloaded
+  // from an existing state.json). Gates location rewrites so startup can never
+  // persist an empty catalog over a valid state.json.
+  property bool catalogLoaded: false
+  property var cities: []
+  property var spotsByCity: Object.create(null)   // city -> [spot]
+  property var userSpots: []       // user-added spots (same fields + city)
+  property var journal: []         // rated spots
+  property var undoSnapshot: null
+  // token (lowercase, non-alphanumerics stripped) -> catalog slug, rebuilt from
+  // the loaded city keys plus a few curated display-name aliases (newyork,
+  // newyorkcity, sopaulo) so canonicalCityKey() can canonicalize free-form city
+  // strings.
+  property var cityAliases: Object.create(null)
 
-  // A rate/decline can be undone within this window.
+  // IPC input caps + undo window. rate/unrate truncate user input to these
+  // lengths; undo only replays snapshots younger than undoWindowMs.
+  readonly property int maxNameLen: 256
+  readonly property int maxNotesLen: 2000
+  readonly property int maxCityLen: 100
   readonly property int undoWindowMs: 5 * 60 * 1000
+  // The three caps above, bundled into the single object argument
+  // JournalIdentity.coerceJournalEntry takes — so rate()/undo pass one arg and
+  // the caps stay single-sourced with the ints.
+  readonly property var journalEntryCaps: ({ maxNameLen: root.maxNameLen, maxNotesLen: root.maxNotesLen, maxCityLen: root.maxCityLen })
 
-  function stateObject() {
-    return {
-      updatedAt: Date.now(),
-      home: config.home,
-      radiusKm: config.radiusKm,
-      plan: plan,
-      journal: journal,
-      lastError: lastError,
-      lastActionAt: (lastUndo && lastUndo.at) ? lastUndo.at : 0
-    };
+  // Subset of fields BarWidget actually reads — keeps state.json lean. Derived
+  // from SpotUtils.spotFieldTypes (one source of truth for the field set): the
+  // map's insertion order is the field order written into state.json.
+  readonly property var persistedSpotFields: Object.keys(SpotUtils.spotFieldTypes)
+
+  // Headless seed loader (components/SeedLoader.qml): shells out to bash to
+  // emit `city\tjson` lines from data/*.jsonl and parses them in chunked
+  // slices. `loaded` hands back the parsed catalog; this handler owns the state
+  // writes (cities, cityAliases, catalogLoaded, writeState).
+  SeedLoader {
+    id: seedLoader
+    sourceDir: root.sourceDir
+    onLoaded: function(spotsByCity) {
+      root.cities = Object.keys(spotsByCity).sort();
+      root.spotsByCity = spotsByCity;
+      root.rebuildCityAliases();
+      root.catalogLoaded = true;
+      root.writeState();
+    }
+  }
+
+  StateFile {
+    id: journalFile
+    path: root.journalPath
+    atomicWrites: true
+    onParsed: function(content) { root.loadJournal(content) }
+    onMissing: root.loadJournal("")
+    onOversized: console.warn("omakase: journal.json exceeds cap — keeping previous journal")
+    // The journal holds personal rating notes, so lock it to owner-only after
+    // every write. Fired post-save (after the atomic rename) so the chmod can't
+    // race the write.
+    onSaved: root.lockOwnerOnly(root.journalPath)
+  }
+
+  StateFile {
+    path: root.userSpotsPath
+    atomicWrites: true
+    onParsed: function(content) { root.loadUserSpots(content) }
+    onMissing: root.loadUserSpots("")
+    onOversized: console.warn("omakase: user_spots.json exceeds cap — keeping previous spots")
+  }
+
+  StateFile {
+    id: undoFile
+    path: root.undoPath
+    atomicWrites: true
+    onParsed: function(content) { root.loadUndo(content) }
+    onMissing: root.loadUndo("")
+    onOversized: console.warn("omakase: undo.json exceeds cap — keeping previous snapshot")
+    // undo.json snapshots the whole journal (spot names + up to 2000-char
+    // notes) and persists past the 5-minute window, so lock it owner-only
+    // after every write — same post-rename timing as journalFile.
+    onSaved: root.lockOwnerOnly(root.undoPath)
+  }
+
+  StateFile {
+    path: root.homeDir + "/.local/state/omarchy/settings/weather.json"
+    onParsed: function(content) { root.loadWeatherLocation(content) }
+    // Missing = Omarchy's "auto" mode: Omakase guesses again (may replace a
+    // known home). Oversized = corruption: keep the last known home.
+    onMissing: root.onWeatherMissing()
+    onOversized: root.onWeatherBroken()
+  }
+
+  // Offline timezone -> coordinates probe. Pure bash against the local tz
+  // database; no network, no user-writable input. Wrapped in `timeout 5` so a
+  // stalled subprocess (a hung timedatectl/dbus call) can't leave tzRunning
+  // stuck true; a timeout exits non-zero and routes through the existing
+  // degrade path in onExited.
+  Process {
+    id: tzProbe
+    command: ["timeout", "5", "bash", "-c", "tz=\"\"\nif [ -e /etc/localtime ]; then\n  link=$(readlink -f /etc/localtime 2>/dev/null)\n  case \"$link\" in */zoneinfo/*) tz=${link#*/zoneinfo/} ;; esac\nfi\nif [ -z \"$tz\" ] && [ -r /etc/timezone ]; then\n  tz=$(head -n1 /etc/timezone 2>/dev/null)\nfi\nif [ -z \"$tz\" ] && command -v timedatectl >/dev/null 2>&1; then\n  tz=$(timedatectl show --property=Timezone --value 2>/dev/null)\nfi\ncase \"$tz\" in \"\"|UTC|Etc/*) exit 0 ;; esac\n\ncoord=\"\"\nfor tab in /usr/share/zoneinfo/zone1970.tab /usr/share/zoneinfo/zone.tab /etc/zoneinfo/zone1970.tab /etc/zoneinfo/zone.tab; do\n  if [ -r \"$tab\" ]; then\n    coord=$(awk -F'\\t' -v tz=\"$tz\" '$3==tz {print $2; exit}' \"$tab\")\n    [ -n \"$coord\" ] && break\n  fi\ndone\n[ -n \"$coord\" ] || exit 0\n\nprintf '%s\\n' \"$coord\" | awk '\nfunction iso(v, deg,   sign, d) {\n  sign = (substr(v,1,1) == \"-\") ? -1 : 1\n  d = substr(v,2)\n  return sign * (substr(d,1,deg) + substr(d,deg+1,2)/60 + (length(d) > deg+2 ? substr(d,deg+3,2)/3600 : 0))\n}\n{\n  rest = substr($0,2)\n  idx = match(rest, /[+-]/)\n  if (idx == 0) exit 1\n  print iso(substr($0,1,idx),2), iso(substr($0,idx+1),3)\n}'\n"]
+    stdout: StdioCollector { id: tzStdout; waitForEnd: true }
+    stderr: StdioCollector { id: tzStderr; waitForEnd: true }
+    onExited: function(code) {
+      root.tzRunning = false;
+      if (code !== 0) return;
+      var parts = String(tzStdout.text || "").trim().split(/\s+/);
+      if (parts.length !== 2) return;
+      var lat = parseFloat(parts[0]);
+      var lon = parseFloat(parts[1]);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+      if (root.weatherState === "valid") return;  // a valid weather read landed during the probe
+      root.homeLat = lat;
+      root.homeLon = lon;
+      root.homeSource = "tz";
+      root.persistHomeIfChanged();
+    }
+  }
+
+  // The service is the only writer of state.json, so there is no
+  // watchChanges/onFileChanged — reloading our own writes is pointless. Its
+  // startup read doubles as a catalog load: `parsed` restores the existing
+  // catalog + persisted coordinates (without re-seeding) so a later home move can
+  // be rewritten; a missing, empty, or oversized state still triggers the seed
+  // loader.
+  StateFile {
+    id: stateFile
+    path: root.statePath
+    atomicWrites: true
+    watchChanges: false
+    onParsed: function(content) { root.loadState(content) }
+    onMissing: root.reseedCatalog()
+    onOversized: root.reseedCatalog()
+  }
+
+  Component.onCompleted: {
+    Quickshell.execDetached(["mkdir", "-p", "-m", "700", stateDir]);
+    // mkdir's -m applies only to a newly created dir; tighten a pre-existing
+    // stateDir explicitly (idempotent, safe to race the mkdir).
+    Quickshell.execDetached(["chmod", "700", stateDir]);
+    // Don't start the seed loader here: an existing state.json is already
+    // correct, and re-deriving + re-serializing the full catalog on every
+    // restart is pure waste. A missing/oversized state.json (StateFile's
+    // onMissing/onOversized signals) and `refresh` still run the loader.
+  }
+
+  // Lock a personal-data file to owner-only (chmod 600). journal.json (personal
+  // rating notes) and undo.json (a snapshot of the whole journal) both call this
+  // from their FileView onSaved, post-rename, so the chmod can't race the write.
+  function lockOwnerOnly(path) {
+    Quickshell.execDetached(["chmod", "600", path]);
+  }
+
+  function loadJournal(raw) {
+    // journal.json is user/tool-writable; a non-array here would make rate()/
+    // unrate() throw on .push/.splice/.length. SpotUtils.parseJsonArray's
+    // Array.isArray guard degrades a top-level object to [].
+    root.journal = SpotUtils.parseJsonArray(raw);
+    root.dedupeJournal();
+  }
+  function loadUserSpots(raw) {
+    // user_spots.json is user/tool-writable; a non-array here would make the
+    // next writeState throw on .forEach, breaking state persistence.
+    // SpotUtils.parseJsonArray's Array.isArray guard degrades a top-level
+    // object to [].
+    root.userSpots = SpotUtils.parseJsonArray(raw);
+  }
+
+  // Rebuild the token -> catalog-slug alias map from the loaded city keys plus a
+  // few curated display-name aliases (newyork, newyorkcity, sopaulo) so
+  // canonicalCityKey() has slugs for the current catalog. The map itself is built
+  // by JournalIdentity.buildCityAliases; this wrapper only owns the root.cityAliases
+  // assignment. Called whenever the catalog loads (seed parse or state.json).
+  function rebuildCityAliases() {
+    root.cityAliases = JournalIdentity.buildCityAliases(root.cities);
+  }
+
+  // Rebuild the catalog from seed data once the state read has settled into a
+  // missing/oversized/malformed state (a parsed state loads in place instead).
+  // The seed loader owns catalogLoaded; the fallback re-runs now that
+  // stateLoaded is set, so a weather-less boot can still derive a home.
+  function reseedCatalog() {
+    root.stateLoaded = true;
+    seedLoader.start();
+    root.tryTzFallback();
+  }
+
+  // Load an existing state.json back into memory, skipping the seed loader
+  // (the state is already correct) while restoring the catalog + persisted
+  // coordinates so a later home move can be rewritten in place.
+  function loadState(raw) {
+    var state = SpotUtils.parseJson(raw, {});
+    if (!state || typeof state.spotsByCity !== "object" || Array.isArray(state.spotsByCity)) {
+      // Missing, empty, malformed, or wrong-shaped state — rebuild from seed
+      // data. The old falsy-only guard let a spotsByCity that is a string,
+      // array, or number through, which then threw in the re-sanitize below
+      // (Object.keys / .map) and left catalogLoaded false with no reseed — an
+      // empty widget until state.json was deleted. Treat a shape failure the
+      // same as a load failure so the seed loader re-runs and rewrites state.
+      root.reseedCatalog();
+      return;
+    }
+    // Re-sanitize every restored spot through the persistedSpotFields
+    // whitelist: state.json lives outside the plugin dir and is
+    // user/tool-writable, so a tampered file could otherwise carry arbitrary
+    // fields into memory. writeState sanitizes on the way out; this closes
+    // the read path too. One pass over the catalog (mirrors writeState's
+    // map), added on top of the JSON.parse that already dominates this
+    // synchronous load. A city value that is not an array (a stray
+    // string/number/object/null) is treated as empty rather than throwing on
+    // `.map`; sanitizeSpot handles a null/non-object element inside an array.
+    root.spotsByCity = Object.keys(state.spotsByCity).reduce(function (byCity, city) {
+      var citySpots = state.spotsByCity[city];
+      byCity[city] = Array.isArray(citySpots)
+        ? citySpots.map(function (spot) { return root.sanitizeSpot(spot); })
+        : [];
+      return byCity;
+    }, Object.create(null));
+    root.cities = Array.isArray(state.cities) ? state.cities : Object.keys(state.spotsByCity).sort();
+    root.rebuildCityAliases();
+    root.persistedHomeLat = typeof state.homeLat === "number" ? state.homeLat : 0;
+    root.persistedHomeLon = typeof state.homeLon === "number" ? state.homeLon : 0;
+    root.persistedHomeSource = (state.homeSource === "weather" || state.homeSource === "tz") ? state.homeSource : "";
+    root.catalogLoaded = true;
+    root.stateLoaded = true;
+    root.tryTzFallback();
+    // A weather read can resolve before the state file finishes loading; persist
+    // it now that writes are unblocked (guard skips when nothing resolved).
+    root.persistHomeIfChanged();
+  }
+
+  function loadWeatherLocation(raw) {
+    var location = SpotUtils.parseJson(raw, {});
+    var lat = parseFloat(location.latitude);
+    var lon = parseFloat(location.longitude);
+    // A present-but-garbled weather.json is corruption: keep a known home (the
+    // broken path never replaces). A genuine (0,0) parses finite and is applied
+    // as before.
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      root.onWeatherBroken();
+      return;
+    }
+    root.weatherState = "valid";
+    root.homeLat = lat;
+    root.homeLon = lon;
+    root.homeSource = "weather";
+    root.persistHomeIfChanged();
+  }
+
+  function onWeatherMissing() {
+    root.weatherState = "missing";
+    root.tryTzFallback();
+  }
+
+  function onWeatherBroken() {
+    root.weatherState = "broken";
+    root.tryTzFallback();
+  }
+
+  // Single fallback hook (Stage 2's IP refinement plugs in here). Runs once the
+  // state and the weather read are both known. Missing weather (auto mode)
+  // re-derives and replaces a known home; broken weather keeps it.
+  function tryTzFallback() {
+    if (!root.stateLoaded || !(root.weatherState === "missing" || root.weatherState === "broken") || root.tzRunning) return;
+    // Broken (present but corrupt/oversized) with a known home: keep it. Only
+    // derive when nothing is known yet (better than nothing).
+    if (root.weatherState === "broken" && (root.persistedHomeLat !== 0 || root.persistedHomeLon !== 0)) return;
+    root.tzRunning = true;
+    tzProbe.running = true;
+  }
+
+  // Persist state.json only when the home or its source actually changed AND the
+  // catalog is loaded. Fired from loadWeatherLocation (live weather changes), the
+  // tz fallback, and loadState (startup), so the decision is independent of which
+  // source resolves first. The empty-source guard prevents writing the empty
+  // in-memory home over a kept persisted home on weather-less boots (a clobber);
+  // the source comparison makes a source-only change ("tz" upgraded to "weather")
+  // persist, so a user-set home can't keep "tz" and be replaced by a re-derivation.
+  function persistHomeIfChanged() {
+    if (!root.catalogLoaded || root.homeSource === "") return;
+    if (root.homeLat !== root.persistedHomeLat || root.homeLon !== root.persistedHomeLon ||
+        root.homeSource !== root.persistedHomeSource) {
+      root.writeState();
+    }
+  }
+
+  function loadUndo(raw) { root.undoSnapshot = SpotUtils.parseJson(raw, null); }
+
+  // Drop every field not in persistedSpotFields, so an unknown/injected field a
+  // user_spots.json entry carries can't survive into state.json. Kept fields are
+  // also coerced to their correct type (see SpotUtils.coerceSpotField), so a
+  // wrong-typed value (price: 123, transactions: "delivery") can't reach the bar
+  // widget, whose formatters assume strings/arrays/numbers and throw otherwise.
+  function sanitizeSpot(spot) {
+    // A non-object entry (null from a truncated/corrupt file, or a stray
+    // string/number/array) carries no spot fields — reduce it to an empty
+    // object rather than throwing on the field read.
+    if (!SpotUtils.isPlainObject(spot)) return {};
+    return root.persistedSpotFields.reduce(function (kept, field) {
+      var value = spot[field];
+      if (value === undefined || value === null) return kept;
+      var coerced = SpotUtils.coerceSpotField(field, value);
+      if (coerced !== undefined) kept[field] = coerced;
+      return kept;
+    }, {});
   }
 
   function writeState() {
-    stateFile.setText(JSON.stringify(stateObject(), null, 2) + "\n");
-  }
-
-  function writeConfig() {
-    configFile.setText(JSON.stringify(config, null, 2) + "\n");
-  }
-
-  function writeUndo() {
-    undoFile.setText(lastUndo ? JSON.stringify(lastUndo, null, 2) + "\n" : "null\n");
+    // root.spotsByCity may already contain merged user spots: loadState
+    // restores it wholesale from a state.json that writeState had written with
+    // the user spots appended. Re-appending root.userSpots would therefore
+    // duplicate one copy per write. JournalIdentity.mergeUserSpots dedups by
+    // normalized name within each city — dropping any existing entry whose name
+    // matches a current user spot, then appending the current user spots — so
+    // the user's latest edit always wins over the stale merged copy still
+    // sitting in spotsByCity. Serialization stays here.
+    var allCitySpots = JournalIdentity.mergeUserSpots(root.spotsByCity, root.userSpots, root.sanitizeSpot);
+    // With no live home resolved this session, write the kept persisted home
+    // instead of the empty in-memory 0/"" so an unrelated rewrite (refresh →
+    // seedLoader.onLoaded) can't clobber it with zeros.
+    var homeLat = root.homeSource !== "" ? root.homeLat : root.persistedHomeLat;
+    var homeLon = root.homeSource !== "" ? root.homeLon : root.persistedHomeLon;
+    var homeSource = root.homeSource !== "" ? root.homeSource : root.persistedHomeSource;
+    // These top-level key names are state.json's file contract — BarWidget's
+    // loadCatalog mirrors them, so renaming one means both sides move together.
+    stateFile.setText(JSON.stringify({
+      updatedAt: Date.now(),
+      cities: Object.keys(allCitySpots).sort(),
+      spotsByCity: allCitySpots,
+      homeLat: homeLat,
+      homeLon: homeLon,
+      // Service-only source: lets a restart tell user-set ("weather") from
+      // the offline timezone approximation ("tz"). BarWidget reads only
+      // homeLat/homeLon, so this extra key is inert there.
+      homeSource: homeSource
+    }));
+    root.persistedHomeLat = homeLat;
+    root.persistedHomeLon = homeLon;
+    root.persistedHomeSource = homeSource;
   }
 
   function writeJournal() {
-    journalFile.setText(JSON.stringify(journal, null, 2) + "\n");
+    journalFile.setText(JSON.stringify(root.journal));
   }
 
-  function writePlan() {
-    planFile.setText(JSON.stringify(plan, null, 2) + "\n");
+  // One-time normalization: collapse duplicate journal entries that resolve to
+  // the same spot (via journalSpotKey) down to one, keeping the newest entry and
+  // its rating/notes. Runs on every journal load and is idempotent — a clean
+  // journal passes through unchanged and rewrites only when something was
+  // merged. The single-pass newest-wins dedupe lives in
+  // JournalIdentity.dedupeJournalEntries; this wrapper owns the root.journal
+  // assignment + rewrite.
+  function dedupeJournal() {
+    var result = JournalIdentity.dedupeJournalEntries(root.journal, root.cityAliases);
+    if (result.merged === 0) return;
+    root.journal = result.entries;
+    root.writeJournal();
   }
 
-  function applyUndo(raw) {
-    try {
-      var parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && parsed.entryId && parsed.item) {
-        lastUndo = (Date.now() - (parsed.at || 0) <= undoWindowMs) ? parsed : null;
-        return;
-      }
-    } catch (e) {
-      // keep lastUndo null on parse failure
-    }
-    lastUndo = null;
+  // --- Journal identity ---
+  //
+  // A spot's journal identity is its normalized name (trim + lowercase). The
+  // stored `city` field is unreliable metadata: older data stored free-form
+  // strings ("new york", "flushing") while the UI now passes the catalog slug
+  // ("nyc"). Matching is therefore name-first; city only disambiguates
+  // same-named spots when both sides canonicalize to a known catalog slug. The
+  // canonicalization (cityAliasToken/canonicalCityKey/journalSpotKey) and the
+  // name-first lookup live in JournalIdentity; this wrapper supplies root.journal
+  // and root.cityAliases.
+
+  function findJournalIndex(name, city) {
+    return JournalIdentity.findJournalIndex(root.journal, name, city, root.cityAliases);
   }
 
-  function applyConfig(raw) {
-    try {
-      var parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") {
-        config = M.mergeConfig(config, parsed);
-      }
-    } catch (e) {
-      // keep defaults on parse failure
-    }
-    if (!locatedOnce && config.home.lat === 0 && config.home.lon === 0) {
-      locatedOnce = true;
-      locateIp();
-    }
-    writeState();
-    refreshDebounce.restart();
-  }
-
-  // Parse a JSON array, falling back to [] on any failure.
-  function parseArray(raw) {
-    try {
-      var parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch (e) {
-      return [];
-    }
-  }
-
-  function applyJournal(raw) {
-    journal = parseArray(raw);
-    writeState();
-  }
-
-  function applyPlan(raw) {
-    plan = parseArray(raw);
-    writeState();
-  }
-
-  // Cache files feed in-memory catalogs only — they never appear in state.json,
-  // so loading one needs no state write (unlike journal/plan, which the widget
-  // reads from state).
-  function applyCache(kind, raw) {
-    var arr = parseArray(raw);
-    if (kind === "restaurants") restaurants = arr;
-    else if (kind === "recipes") recipes = arr;
-    else drinks = arr;
-  }
-
-  function allCandidates() {
-    return restaurants.concat(recipes);
-  }
-
-  function refresh() {
-    if (config.home && config.home.lat && config.home.lon) {
-      fetchRestaurants();
-    }
-    fetchRecipes("a"); // TheMealDB "a" returns a broad sample
-    fetchDrinks();
-    return "ok";
-  }
-
-  function runFetch(kind, args) {
-    var p = fetchComponent.createObject(root, { svc: root, kind: kind });
-    p.command = ["bash", root.sourceDir + "/bin/fetch-" + kind + ".sh"].concat(args || []);
-    p.running = true;
-  }
-
-  function fetchRestaurants(query) {
-    var args = [String(config.home.lat), String(config.home.lon), String(config.radiusKm)];
-    if (query) args.push(query);
-    runFetch("restaurants", args);
-  }
-
-  function fetchRecipes(query) {
-    runFetch("recipes", [query]);
-  }
-
-  function fetchDrinks() {
-    runFetch("drinks", []);
-  }
-
-  function handleFetch(kind, exitCode, outText) {
-    if (exitCode !== 0) {
-      lastError = outText && outText.trim() !== "" ? outText.trim() : "fetch " + kind + " failed";
-      writeState();
-      return;
-    }
-    applyCache(kind, outText);
-    // On first install only, seed an initial plan once candidates are available
-    // and today's plan is empty. Subsequent startups leave an empty plan alone
-    // until the next midnight rollover (see refreshTimer).
-    if (firstRun && (restaurants.length > 0 || recipes.length > 0)) {
-      if (plan.length === 0 || !plan[0].meals || plan[0].meals.length === 0) {
-        generatePlan("day");
-      }
-      markerFile.setText("1\n");
-      firstRun = false;
-    }
-    if (lastError !== "") {
-      lastError = "";
-      writeState();
-    }
-  }
-
-  function addMeal(json) {
-    try {
-      var entry = JSON.parse(json);
-      var v = M.validateMeal(entry);
-      if (!v.ok) return "error: " + v.error;
-      entry.id = entry.id || M.makeId("m");
-      entry.timestamp = entry.timestamp || Date.now();
-      entry.cuisine = entry.cuisine || M.normalizeCuisine(entry.name);
-      journal.push(entry);
-      writeJournal();
-      writeState();
-      return "ok";
-    } catch (e) {
-      return "error: invalid json";
-    }
-  }
-
-  function removeMeal(id) {
-    journal = journal.filter(function(e) { return e.id !== id; });
-    writeJournal();
-    writeState();
-    return "ok";
-  }
-
-  function generatePlan(period) {
-    var p = period || "day";
-    if (p === "day" && plan.length > 0 && plan[0].date === todayStr() && plan[0].meals && plan[0].meals.length > 0) {
-      return "ok"; // sticky: keep today's plan, do not re-scramble
-    }
-    buildPlan(p);
-    return "ok";
-  }
-
-  function todayStr() {
-    var d = new Date();
-    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
-  }
-
-  function buildPlan(period) {
-    var p = period || "day";
-    plan = M.generatePlan(allCandidates(), journal, { period: p, radiusKm: config.radiusKm, drinks: drinks });
-    writePlan();
-    writeState();
-  }
-
-  function recordMeal(id, extras) {
-    for (var d = 0; d < plan.length; d++) {
-      for (var m = 0; m < plan[d].meals.length; m++) {
-        var item = plan[d].meals[m];
-        if (item.id !== id) continue;
-        var entry = {
-          id: M.makeId("m"),
-          timestamp: Date.now(),
-          mealType: item.mealType,
-          name: item.name,
-          cuisine: item.cuisine,
-          source: item.source,
-          drink: item.drink || "",
-          restaurantId: item.source === "restaurant" ? item.id : undefined,
-          recipeId: item.source === "recipe" ? item.id : undefined,
-          declined: !!(extras && extras.declined === true)
-        };
-        if (extras && typeof extras.rating === "number") entry.rating = extras.rating;
-        var n = (extras && typeof extras.notes === "string") ? extras.notes.trim() : "";
-        if (n !== "") entry.notes = n;
-        journal.push(entry);
-        writeJournal();
-        lastUndo = {
-          entryId: entry.id,
-          item: JSON.parse(JSON.stringify(item)),
-          dayIndex: d,
-          mealIndex: m,
-          at: Date.now()
-        };
-        writeUndo();
-        plan[d].meals.splice(m, 1);
-        writePlan();
-        writeState();
-        return "ok";
-      }
-    }
-    return "error: plan item not found";
-  }
-
-  function rate(id, rating, notes) {
-    var r = Number(rating);
-    if (isNaN(r) || r < 1 || r > 5) return "error: rating must be 1-5";
-    return recordMeal(id, { rating: r, notes: notes });
-  }
-
-  function decline(id, notes) {
-    return recordMeal(id, { declined: true, notes: notes });
-  }
-
-  function undo() {
-    if (!lastUndo) return "error: nothing to undo";
-    if (Date.now() - lastUndo.at > undoWindowMs) {
-      lastUndo = null;
-      writeUndo();
-      writeState();
-      return "error: too late to undo";
-    }
-    journal = journal.filter(function(e) { return e.id !== lastUndo.entryId; });
-    var day = plan[lastUndo.dayIndex];
-    if (!day || !Array.isArray(day.meals)) {
-      if (plan.length === 0) plan.push({ date: todayStr(), meals: [] });
-      day = plan[0];
-    }
-    var insertAt = Math.min(Math.max(0, lastUndo.mealIndex), day.meals.length);
-    day.meals.splice(insertAt, 0, lastUndo.item);
-    // Re-rank the day: removing the rate/decline entry changes the restored
-    // meal's score, so recompute it (and any meal whose score shifted) instead
-    // of leaving the stale pre-action score on the re-inserted item.
-    day.meals = M.reScorePlan(day.meals, allCandidates(), journal, { radiusKm: config.radiusKm, drinks: drinks });
-    writeJournal();
-    writePlan();
-    writeState();
-    lastUndo = null;
-    writeUndo();
-    return "ok";
-  }
-
-  function searchRestaurants(query) {
-    if (config.home && config.home.lat && config.home.lon) {
-      fetchRestaurants(query);
-    }
-    return "ok";
-  }
-
-  function searchRecipes(query) {
-    fetchRecipes(query);
-    return "ok";
-  }
-
-  function validCoords(lat, lon) {
-    return isFinite(lat) && isFinite(lon) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
-  }
-
-  function setHome(lat, lon) {
-    var nlat = Number(lat);
-    var nlon = Number(lon);
-    if (!validCoords(nlat, nlon)) {
-      return "error: coordinates out of range";
-    }
-    config.home.lat = nlat;
-    config.home.lon = nlon;
-    writeConfig();
-    refresh();
-    return "ok";
-  }
-
-  function locateIp() {
-    var p = locateComponent.createObject(root, { svc: root });
-    p.command = ["bash", root.sourceDir + "/bin/locate-ip.sh"];
-    p.running = true;
-    return "ok";
-  }
-
-  function handleLocate(exitCode, outText) {
-    if (exitCode !== 0 || !outText) return;
-    try {
-      var parsed = JSON.parse(outText);
-      var nlat = Number(parsed.lat);
-      var nlon = Number(parsed.lon);
-      if (!validCoords(nlat, nlon) || nlat === 0 || nlon === 0) {
-        return; // reject bogus (0,0) or out-of-range coordinates
-      }
-      config.home.lat = nlat;
-      config.home.lon = nlon;
-      config.home.city = parsed.city || "";
-      writeConfig();
-      refresh();
-    } catch (e) {
-      // ignore malformed geolocation output
-    }
-  }
-
-  FileView {
-    id: configFile
-    path: root.configPath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.applyConfig(text())
-    onLoadFailed: root.applyConfig("")
-    onFileChanged: reload()
-  }
-
-  FileView {
-    id: stateFile
-    path: root.statePath
-    watchChanges: false
-    atomicWrites: true
-    printErrors: false
-    onSaveFailed: {
-      Quickshell.execDetached(["mkdir", "-p", root.stateDir]);
-      stateRetryTimer.restart();
-    }
-  }
-
-  FileView {
-    id: journalFile
-    path: root.journalPath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.applyJournal(text())
-    onLoadFailed: root.applyJournal("")
-    onFileChanged: reload()
-  }
-
-  FileView {
-    id: planFile
-    path: root.planPath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.applyPlan(text())
-    onLoadFailed: root.applyPlan("")
-    onFileChanged: reload()
-  }
-
-  FileView {
-    id: undoFile
-    path: root.undoPath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.applyUndo(text())
-    onLoadFailed: root.applyUndo("")
-    onFileChanged: reload()
-  }
-
-  // First-install marker: absent on the very first run, present afterwards.
-  // Its presence gates the one-time plan seeding in handleFetch.
-  FileView {
-    id: markerFile
-    path: root.stateDir + "/.initialized"
-    watchChanges: false
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.firstRun = false
-    onLoadFailed: root.firstRun = true
-  }
-
-  // The bin/ fetch scripts write the cache files; the service only reads them
-  // back through these watchers, so there is one per catalog kind.
-  Instantiator {
-    model: ["restaurants", "recipes", "drinks"]
-    delegate: FileView {
-      required property string modelData
-      path: root.cacheDir + "/" + modelData + ".json"
-      watchChanges: true
-      printErrors: false
-      onLoaded: root.applyCache(modelData, text())
-      onLoadFailed: root.applyCache(modelData, "")
-      onFileChanged: reload()
-    }
-  }
-
-  Timer {
-    id: refreshDebounce
-    interval: 500
-    repeat: false
-    onTriggered: root.refresh()
-  }
-
-  Timer {
-    id: refreshTimer
-    // Lower bound of 60s keeps a refreshIntervalSec of 0 from spinning a tight loop.
-    interval: Math.max(Math.round(Number(config.refreshIntervalSec)) || 3600, 60) * 1000
-    repeat: true
-    running: true
-    triggeredOnStart: true
-    onTriggered: {
-      root.refresh();
-      // Regenerate the plan only when the day rolls over (local midnight) — a
-      // fresh plan for the new day. Empty plans are filled immediately at
-      // startup (see handleFetch), not on this timer.
-      if (plan.length > 0 && plan[0].date !== todayStr()) {
-        root.generatePlan("day");
-      }
-    }
-  }
-
-  Timer {
-    id: stateRetryTimer
-    interval: 1000
-    repeat: false
-    onTriggered: root.writeState()
-  }
-
-  Component {
-    id: fetchComponent
-    Process {
-      id: self
-      property var svc: null
-      property string kind: ""
-      stdout: StdioCollector { id: out; waitForEnd: true }
-      stderr: StdioCollector { waitForEnd: true } // drain: unread, but keeps the child from blocking on a full stderr pipe
-      onExited: function(exitCode) {
-        self.svc.handleFetch(self.kind, exitCode, out.text);
-        self.destroy();
-      }
-    }
-  }
-
-  Component {
-    id: locateComponent
-    Process {
-      id: self
-      property var svc: null
-      stdout: StdioCollector { id: out; waitForEnd: true }
-      stderr: StdioCollector { waitForEnd: true } // drain: unread, but keeps the child from blocking on a full stderr pipe
-      onExited: function(exitCode) {
-        self.svc.handleLocate(exitCode, out.text);
-        self.destroy();
-      }
-    }
+  // Snapshot the journal into undo.json before any mutation so `undo` can
+  // restore the pre-edit journal within undoWindowMs.
+  function saveUndoSnapshot() {
+    root.undoSnapshot = { snapshot: root.journal.slice(), at: Date.now() };
+    undoFile.setText(JSON.stringify(root.undoSnapshot));
   }
 
   IpcHandler {
     target: root.pluginId
-    function ping(): string { return "ok" }
-    function refresh(): string { return root.refresh() }
-    function addMeal(json: string): string { return root.addMeal(json) }
-    function removeMeal(id: string): string { return root.removeMeal(id) }
-    function generatePlan(period: string): string { return root.generatePlan(period) }
-    function rate(id: string, rating: string, notes: string): string { return root.rate(id, rating, notes) }
-    function decline(id: string, notes: string): string { return root.decline(id, notes) }
-    function undo(): string { return root.undo() }
-    function searchRestaurants(query: string): string { return root.searchRestaurants(query) }
-    function searchRecipes(query: string): string { return root.searchRecipes(query) }
-    function setHome(lat: string, lon: string): string { return root.setHome(lat, lon) }
-    function locateIp(): string { return root.locateIp() }
-  }
 
-  Component.onCompleted: {
-    Quickshell.execDetached(["mkdir", "-p", root.configDir]);
-    Quickshell.execDetached(["mkdir", "-p", root.stateDir]);
-    Quickshell.execDetached(["mkdir", "-p", root.cacheDir]);
+    function ping(): string { return "ok" }
+
+    function refresh(): string {
+      seedLoader.start();
+      return "ok";
+    }
+
+    function rate(name: string, rating: string, notes: string, city: string): string {
+      var entry = JournalIdentity.coerceJournalEntry(
+        { timestamp: Date.now(), name: name, rating: rating, notes: notes, city: city },
+        root.journalEntryCaps);
+      if (!entry) return JSON.stringify({ ok: false, error: "usage: rate <name> <1-5> [notes] [city]" });
+      var journalIndex = root.findJournalIndex(entry.name, entry.city);
+      root.saveUndoSnapshot();
+      if (journalIndex >= 0) {
+        root.journal[journalIndex].rating = entry.rating;
+        root.journal[journalIndex].notes = entry.notes;
+        root.journal[journalIndex].timestamp = entry.timestamp;
+        if (entry.city) root.journal[journalIndex].city = entry.city;
+      } else {
+        root.journal.push(entry);
+      }
+      root.writeJournal();
+      return JSON.stringify({ ok: true, data: "ok" });
+    }
+
+    function undo(): string {
+      // Validate before replaying. undo.json lives outside the plugin dir and
+      // is user/tool-writable, so a crafted file could carry a non-array
+      // snapshot or a non-numeric `at` (NaN > window is false — the window is
+      // skipped) and inject arbitrary journal entries that rate() would reject;
+      // a snapshot-less file would set the journal to undefined and wipe it on
+      // the next write. Reject anything the write path (saveUndoSnapshot) could
+      // not have produced and leave the journal untouched on failure.
+      var snapshot = root.undoSnapshot;
+      if (!snapshot || typeof snapshot !== "object" || !Array.isArray(snapshot.snapshot) ||
+          !Number.isFinite(snapshot.at) || (Date.now() - snapshot.at) > root.undoWindowMs)
+        return JSON.stringify({ ok: false, error: "nothing to undo (no valid snapshot within the last 5 minutes)" });
+      root.journal = snapshot.snapshot.map(function (entry) { return JournalIdentity.coerceJournalEntry(entry, root.journalEntryCaps); }).filter(Boolean);
+      root.undoSnapshot = null;
+      // Re-normalize so undoing a pre-dedup snapshot can't reintroduce duplicates.
+      root.dedupeJournal();
+      root.writeJournal();
+      undoFile.setText("");
+      return JSON.stringify({ ok: true, data: "ok" });
+    }
+
+    function unrate(name: string, city: string): string {
+      name = (name || "").slice(0, root.maxNameLen);
+      city = SpotUtils.normalizeName(city || "").slice(0, root.maxCityLen);
+      if (!name) return JSON.stringify({ ok: false, error: "usage: unrate <name> [city]" });
+      var journalIndex = root.findJournalIndex(name, city);
+      if (journalIndex < 0) return JSON.stringify({ ok: false, error: "no rating found" });
+      root.saveUndoSnapshot();
+      root.journal.splice(journalIndex, 1);
+      root.writeJournal();
+      return JSON.stringify({ ok: true, data: "ok" });
+    }
   }
 }

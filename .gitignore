@@ -1,3 +1,14 @@
 *.qmlc
 *.jsc
-node_modules/
+*.swp
+*.swo
+*~
+.env
+.env.*
+!.env.example
+*.bak
+*.tmp
+*.orig
+# Pipeline resume markers
+.fetch-progress
+.website-progress

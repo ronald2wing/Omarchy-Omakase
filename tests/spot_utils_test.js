@@ -9,6 +9,14 @@ const { assert, report } = require("./_assert.js");
 assert("MAX_STATE_BYTES is 4 MiB", M.MAX_STATE_BYTES === 4194304);
 assert("MAX_STATE_BYTES > 2 MiB", M.MAX_STATE_BYTES > 2 * 1024 * 1024);
 
+// ----- pending-rate handoff constants -----
+assert("PENDING_RATE_FILE name", M.PENDING_RATE_FILE === "pending_rate.json");
+// 8192 admits any payload the writer can produce from the Service's own field
+// caps (worst case: all-CJK notes ≈7.1 KB), while staying a hard byte stop.
+assert("MAX_PENDING_RATE_BYTES is 8192", M.MAX_PENDING_RATE_BYTES === 8192);
+assert("JOURNAL_CAPS maxNotesLen", M.JOURNAL_CAPS.maxNotesLen === 2000);
+assert("stateDirSetupArgs argv", JSON.stringify(M.stateDirSetupArgs("/tmp/x")) === '["sh","-c","mkdir -p -m 700 \\"$1\\" && chmod 700 \\"$1\\"","_","/tmp/x"]');
+
 // ----- utf8Length -----
 // The clipboard `head -c $n` byte count must match what QProcess writes for the
 // same QString (UTF-8): ASCII 1, two-byte é, four-byte emoji, and a lone

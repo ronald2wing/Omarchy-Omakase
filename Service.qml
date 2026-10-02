@@ -19,6 +19,10 @@ Item {
   readonly property string journalPath: stateDir + "/" + SpotUtils.JOURNAL_FILE
   readonly property string userSpotsPath: stateDir + "/user_spots.json"
   readonly property string undoPath: stateDir + "/undo.json"
+  // Owner-only handoff: BarWidget writes a pending rating payload here and fires
+  // `consume` (content-free argv), so journal note text never rides in a process
+  // argument list. Lives in the 0700 state dir; the file itself is chmod 0600.
+  readonly property string pendingRatePath: stateDir + "/" + SpotUtils.PENDING_RATE_FILE
   readonly property string sourceDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : homeDir + "/.config/omarchy/plugins/" + pluginId
 
   property double homeLat: 0
@@ -61,11 +65,12 @@ Item {
   // strings.
   property var cityAliases: Object.create(null)
 
-  // IPC input caps + undo window. rate/unrate truncate user input to these
-  // lengths; undo only replays snapshots younger than undoWindowMs.
-  readonly property int maxNameLen: 256
-  readonly property int maxNotesLen: 2000
-  readonly property int maxCityLen: 100
+  // IPC input caps + undo window. The three caps single-source from
+  // SpotUtils.JOURNAL_CAPS (shared with BarWidget's pending-rate payload) so
+  // the two can never drift.
+  readonly property int maxNameLen: SpotUtils.JOURNAL_CAPS.maxNameLen
+  readonly property int maxNotesLen: SpotUtils.JOURNAL_CAPS.maxNotesLen
+  readonly property int maxCityLen: SpotUtils.JOURNAL_CAPS.maxCityLen
   readonly property int undoWindowMs: 5 * 60 * 1000
   // The three caps above, bundled into the single object argument
   // JournalIdentity.coerceJournalEntry takes — so rate()/undo pass one arg and
@@ -178,11 +183,35 @@ Item {
     onOversized: root.reseedCatalog()
   }
 
+  // Read half of the pending-rate handoff. BarWidget (a separate process) writes
+  // the payload and triggers `consume`; this FileView reads it back on demand.
+  // `blockAllReads` makes reload()/text() synchronous so consume() can apply and
+  // answer in one call; `blockWrites` makes the setText("") clear a synchronous
+  // atomic write so the file is emptied before consume() answers (closes the
+  // read-then-async-clear TOCTOU where a second consume could see a stale
+  // payload). `watchChanges:false` because only consume() reads it (the writer
+  // signals via IPC, not the filesystem). `onSaved` re-locks the file to 0600
+  // after the consume-and-clear write.
+  FileView {
+    id: pendingRateFile
+    path: root.pendingRatePath
+    preload: false
+    printErrors: false
+    blockAllReads: true
+    blockWrites: true
+    watchChanges: false
+    atomicWrites: true
+    onSaved: root.lockOwnerOnly(root.pendingRatePath)
+  }
+
   Component.onCompleted: {
-    Quickshell.execDetached(["mkdir", "-p", "-m", "700", stateDir]);
-    // mkdir's -m applies only to a newly created dir; tighten a pre-existing
-    // stateDir explicitly (idempotent, safe to race the mkdir).
-    Quickshell.execDetached(["chmod", "700", stateDir]);
+    // Clear any pending-rate leftover from a previous session (a write whose
+    // consume never ran, e.g. a crash mid-handoff) so a later consume can't
+    // replay stale note text. The path is a constant, not user input.
+    Quickshell.execDetached(["rm", "-f", root.pendingRatePath]);
+    // Ensure the state dir exists and is owner-only (0700); the argv lives in
+    // SpotUtils.stateDirSetupArgs so Service and BarWidget can't drift.
+    Quickshell.execDetached(SpotUtils.stateDirSetupArgs(stateDir));
     // Don't start the seed loader here: an existing state.json is already
     // correct, and re-deriving + re-serializing the full catalog on every
     // restart is pure waste. A missing/oversized state.json (StateFile's
@@ -424,6 +453,25 @@ Item {
     undoFile.setText(JSON.stringify(root.undoSnapshot));
   }
 
+  // Apply a coerced journal entry — upsert by journal identity or push a new
+  // one — with the undo snapshot + journal rewrite. `preserveNotes` keeps the
+  // existing entry's notes on an upsert: the notes-less IPC `rate` (stars only)
+  // passes true so it can never blank a note a notes edit had already written,
+  // while `consume` (the full payload) passes false so the file's notes win.
+  function applyJournalEntry(entry, preserveNotes) {
+    var journalIndex = root.findJournalIndex(entry.name, entry.city);
+    root.saveUndoSnapshot();
+    if (journalIndex >= 0) {
+      root.journal[journalIndex].rating = entry.rating;
+      if (!preserveNotes) root.journal[journalIndex].notes = entry.notes;
+      root.journal[journalIndex].timestamp = entry.timestamp;
+      if (entry.city) root.journal[journalIndex].city = entry.city;
+    } else {
+      root.journal.push(entry);
+    }
+    root.writeJournal();
+  }
+
   IpcHandler {
     target: root.pluginId
 
@@ -434,22 +482,34 @@ Item {
       return "ok";
     }
 
-    function rate(name: string, rating: string, notes: string, city: string): string {
+    // Stars-only rate (no notes — note text flows through the pending-rate file
+    // so it never rides in an argv). Preserves any existing notes on upsert.
+    function rate(name: string, rating: string, city: string): string {
       var entry = JournalIdentity.coerceJournalEntry(
-        { timestamp: Date.now(), name: name, rating: rating, notes: notes, city: city },
+        { timestamp: Date.now(), name: name, rating: rating, notes: "", city: city },
         root.journalEntryCaps);
-      if (!entry) return JSON.stringify({ ok: false, error: "usage: rate <name> <1-5> [notes] [city]" });
-      var journalIndex = root.findJournalIndex(entry.name, entry.city);
-      root.saveUndoSnapshot();
-      if (journalIndex >= 0) {
-        root.journal[journalIndex].rating = entry.rating;
-        root.journal[journalIndex].notes = entry.notes;
-        root.journal[journalIndex].timestamp = entry.timestamp;
-        if (entry.city) root.journal[journalIndex].city = entry.city;
-      } else {
-        root.journal.push(entry);
-      }
-      root.writeJournal();
+      if (!entry) return JSON.stringify({ ok: false, error: "usage: rate <name> <1-5> [city]" });
+      root.applyJournalEntry(entry, true);
+      return JSON.stringify({ ok: true, data: "ok" });
+    }
+
+    // Consume the pending-rate payload BarWidget staged: read the owner-only
+    // file, apply its entry (notes included), and clear the file. The payload is
+    // byte-bounded and identity-coerced exactly like a direct rate, so a crafted
+    // file can't inject an over-long field or an out-of-range rating.
+    function consume(): string {
+      pendingRateFile.reload();
+      var raw = pendingRateFile.text();
+      var oversized = SpotUtils.utf8Length(raw) > SpotUtils.MAX_PENDING_RATE_BYTES;
+      var req = oversized ? null : SpotUtils.parseJson(raw, null);
+      pendingRateFile.setText("");  // consume-once: clear on every path (valid, malformed, invalid, oversized)
+      if (oversized) return JSON.stringify({ ok: false, error: "payload too large" });
+      if (!req) return JSON.stringify({ ok: false, error: "payload missing/malformed" });
+      var entry = JournalIdentity.coerceJournalEntry(
+        { timestamp: Date.now(), name: req.name, rating: req.rating, notes: req.notes, city: req.city },
+        root.journalEntryCaps);
+      if (!entry) return JSON.stringify({ ok: false, error: "invalid payload" });
+      root.applyJournalEntry(entry, false);
       return JSON.stringify({ ok: true, data: "ok" });
     }
 

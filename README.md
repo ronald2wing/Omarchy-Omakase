@@ -175,10 +175,14 @@ The service exposes a small command surface you can call from a terminal:
 ```bash
 omarchy-shell omakase ping
 omarchy-shell omakase refresh                                  # re-read the seed data
-omarchy-shell omakase rate "<name>" <1-5> [notes] [city]       # rate or update a spot
+omarchy-shell omakase rate "<name>" <1-5> [city]               # rate or update a spot (stars only — notes are set in the widget)
 omarchy-shell omakase unrate "<name>" [city]                   # remove a rating
 omarchy-shell omakase undo                                     # revert the last rate/unrate (within 5 min)
 ```
+
+`consume` is the widget's internal handoff (the bar stages a rating's notes to
+an owner-only file, then calls `consume` to apply them) and is not a public
+command.
 
 ## License
 

@@ -15,6 +15,10 @@ Panel {
 
   // State directory read by the FileViews below (Service owns every write).
   readonly property string stateDir: Quickshell.env("HOME") + SpotUtils.STATE_DIR_SUFFIX
+  // Write half of the pending-rate handoff: the payload (name/rating/notes/city)
+  // is staged here and Service's `consume` reads it, so note text never rides in
+  // an `omarchy-shell` argv. Owner-only file in the 0700 state dir.
+  readonly property string pendingRatePath: root.stateDir + "/" + SpotUtils.PENDING_RATE_FILE
 
   // ---- Panel state ----
   property var catalog: ({ cities: [], spotsByCity: Object.create(null), homeLat: 0, homeLon: 0 })
@@ -496,6 +500,22 @@ Panel {
     onOversized: console.warn("omakase: wishlist.json exceeds cap — keeping previous wishlist")
   }
 
+  // Write half of the pending-rate handoff — write-only (preload:false skips the
+  // eager startup read; printErrors:false suppresses the missing-file warning
+  // before the first write). `blockWrites` makes setText() a synchronous atomic
+  // write, so the file is fully on disk before rateSpot fires the `consume`
+  // trigger; `onSaved` re-locks it to 0600 after the rename (the writer must own
+  // the chmod because atomic writes replace the file).
+  FileView {
+    id: pendingRateFile
+    path: root.pendingRatePath
+    preload: false
+    printErrors: false
+    atomicWrites: true
+    blockWrites: true
+    onSaved: root.lockOwnerOnly(root.pendingRatePath)
+  }
+
   // One-shot probe for a registered `tel:` URI handler, run once per widget
   // instance at load (a multi-monitor setup instantiates the widget per
   // monitor, so the probe may run twice — harmless). Mirrors Service.qml's
@@ -903,6 +923,11 @@ Panel {
   }
 
   Component.onCompleted: {
+    // Ensure the state dir exists and is owner-only (0700) before the first
+    // pending-rate write, so the writer doesn't depend on Service startup
+    // ordering. The argv lives in SpotUtils.stateDirSetupArgs (shared with
+    // Service.qml) so the two can't drift.
+    Quickshell.execDetached(SpotUtils.stateDirSetupArgs(root.stateDir));
     root.refreshRatings();
     root.buildCityLabelMap();
     root.refreshSavedSet();
@@ -1744,11 +1769,21 @@ Panel {
   }
 
   // Fire an omakase IPC command. The method string is a parameter (the typed
-  // rateSpot/unrateSpot wrappers below pass "rate"/"unrate"), so this seam
-  // stays generic. All rating actions go through the Service, which owns the
-  // journal — the bar widget never writes it.
+  // rateSpot/unrateSpot wrappers below pass "consume"/"unrate"), so this seam
+  // stays generic. Only non-secret args may ride here (method name, spot name,
+  // city slug — all public catalog data); journal note text goes through the
+  // owner-only pending-rate file + `consume`, never through an argv. All rating
+  // actions go through the Service, which owns the journal — the bar widget
+  // never writes it.
   function sendIpcCommand(method, args) {
     Quickshell.execDetached(["omarchy-shell", root.moduleName, method].concat(args));
+  }
+
+  // Lock a personal-data file to owner-only (chmod 600). The pending-rate file
+  // is recreated by every atomic write, so the bar widget re-locks it from its
+  // FileView onSaved (post-rename) to keep note text out of group/other reads.
+  function lockOwnerOnly(path) {
+    Quickshell.execDetached(["chmod", "600", path]);
   }
 
   // Stage a notes edit and (re)start the debounce timer; flushNotes() commits
@@ -1801,7 +1836,18 @@ Panel {
       root._pendingNotesText = "";
       notesDebounceTimer.stop();
     }
-    sendIpcCommand("rate", [name, String(stars), notes, city]);
+    // Stage the payload to the owner-only pending-rate file and trigger
+    // consume(): the notes text is written to a 0600 file, never placed in an
+    // argv, so it can't leak through /proc/<pid>/cmdline. The field caps read
+    // SpotUtils.JOURNAL_CAPS (shared with Service) so the staged payload is no
+    // larger than what consume() would accept anyway.
+    pendingRateFile.setText(JSON.stringify({
+      name: String(name).slice(0, SpotUtils.JOURNAL_CAPS.maxNameLen),
+      rating: String(stars),
+      notes: String(notes).slice(0, SpotUtils.JOURNAL_CAPS.maxNotesLen),
+      city: String(city).slice(0, SpotUtils.JOURNAL_CAPS.maxCityLen)
+    }));
+    sendIpcCommand("consume", []);
   }
   function unrateSpot(name, city) {
     root.ratingHold = true;

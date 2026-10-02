@@ -216,6 +216,16 @@ Panel {
   // flushNotes() on a real notes commit and reset after the shared copy
   // feedback duration; the editor binds its label visibility to this.
   property bool notesJustSaved: false
+  // True while the clipboard Process has a run in flight (or draining a hung
+  // one it just killed); startClipboardRun() sets it before `running = true` and
+  // only the onExited handler clears it, so a copy that lands mid-flight stashes
+  // to pendingText (last copy wins).
+  property bool clipboardBusy: false
+  // Watchdog windows for a clipboard run: a spawn that never starts is detected
+  // after clipboardStartWindow; a started-but-hung process gets
+  // clipboardHangWindow before being killed.
+  readonly property int clipboardStartWindow: 3000
+  readonly property int clipboardHangWindow: 10000
   // Restarted by notesEdited() on every keystroke; onTriggered commits the
   // staged notes through flushNotes().
   Timer {
@@ -499,6 +509,83 @@ Panel {
     onExited: function(exitCode, exitStatus) {
       if (exitCode !== 0 || exitStatus !== 0) { root.telHandlerAvailable = false; return; }
       root.telHandlerAvailable = String(telProbeStdout.text || "").trim().length > 0;
+    }
+  }
+
+  // Clipboard handoff: the copied text is piped over stdin, never placed in an
+  // argv. `head -c $1` reads exactly the byte count passed as $1 (a number, not
+  // the text) and pipes to wl-copy, falling back to xclip. stdinEnabled lets
+  // copyToClipboard() write the text after the process starts; a copy landing
+  // mid-flight is stashed for an onExited restart (last copy wins).
+  Process {
+    id: clipboard
+    // `command` is assigned by startClipboardRun just before `running` is set,
+    // so no placeholder is declared here.
+    stdinEnabled: true
+    // Text captured for the run currently starting (matches the command's $1).
+    property string outgoingText: ""
+    // Text for a copy that arrived while a run was in flight.
+    property string pendingText: ""
+    // Monotonic token for the run currently in flight. Incremented each time a
+    // run is launched; the watchdog stamps armedSeq from it, so a trigger armed
+    // for an already-superseded run can't clobber the newer one's state.
+    property int runSeq: 0
+    onStarted: function() {
+      // Feed the text over stdin (never argv). Do NOT cancel the watchdog here:
+      // a started process can still hang, so re-arm it for the longer hang
+      // window — only onExited is allowed to dismiss it.
+      if (clipboard.outgoingText !== "") {
+        clipboard.write(clipboard.outgoingText);
+        clipboard.outgoingText = "";
+      }
+      clipboardWatchdog.armedSeq = clipboard.runSeq;
+      clipboardWatchdog.interval = root.clipboardHangWindow;
+      clipboardWatchdog.restart();
+    }
+    onExited: function(exitCode, exitStatus) {
+      // Only a real exit cancels the watchdog.
+      clipboardWatchdog.stop();
+      root.clipboardBusy = false;
+      // Flush a copy that landed mid-flight (last copy wins) by starting a fresh
+      // run for it.
+      if (clipboard.pendingText !== "") {
+        var stashed = clipboard.pendingText;
+        clipboard.pendingText = "";
+        startClipboardRun(stashed);
+      }
+    }
+  }
+
+  // Recovery for the two paths a clipboard run can leave unfinished: a spawn
+  // that fails (neither started nor exited fires) and a started process that
+  // hangs (started fired, exited never does). Armed for the short start window
+  // when a run launches and re-armed for the hang window in onStarted; only
+  // onExited stops it. On trigger it kills a still-running process (whose
+  // onExited then resets state and flushes a stashed copy) or, on the
+  // failed-start path where no exited is coming, resets and flushes directly.
+  // armedSeq ignores a trigger that belongs to an already-superseded run.
+  Timer {
+    id: clipboardWatchdog
+    interval: root.clipboardStartWindow
+    repeat: false
+    property int armedSeq: 0
+    onTriggered: {
+      if (clipboardWatchdog.armedSeq !== clipboard.runSeq) return;
+      clipboard.outgoingText = "";
+      if (clipboard.running) {
+        // Hang: terminate the process. Leave clipboardBusy true so a copy
+        // landing during the drain stashes instead of starting (which would race
+        // the killed run's onExited); that onExited resets state and flushes.
+        clipboard.running = false;
+      } else {
+        // Failed start: no onExited is coming, so recover and flush directly.
+        root.clipboardBusy = false;
+        if (clipboard.pendingText !== "") {
+          var stashed = clipboard.pendingText;
+          clipboard.pendingText = "";
+          startClipboardRun(stashed);
+        }
+      }
     }
   }
 
@@ -1936,12 +2023,36 @@ Panel {
     if (target) Qt.openUrlExternally(target);
   }
 
-  // Copy `text` to the clipboard via wl-copy, falling back to xclip. This is
-  // the single clipboard mechanism both the card's Copy action (SpotCard) and
-  // the collapsed cluster's phone cell (SpotCard) share; the "Copied"
-  // feedback stays with each caller's own transient state.
+  // Start a clipboard run for `text`: set the byte-count argv (the text itself is
+  // written to stdin in onStarted), bump the run token, and arm the watchdog for
+  // the start window. Shared by copyToClipboard, the onExited flush, and the
+  // watchdog's failed-start recovery.
+  function startClipboardRun(text) {
+    clipboard.outgoingText = text;
+    // Only the byte count (a number) enters the argv; the text itself is written
+    // to stdin in onStarted, matching `head -c $1` on the far side.
+    clipboard.command = ["bash", "-c", "n=\"$1\"; head -c \"$n\" | { command -v wl-copy >/dev/null 2>&1 && wl-copy || xclip -selection clipboard 2>/dev/null; }", "_", String(SpotUtils.utf8Length(text))];
+    clipboard.runSeq++;
+    clipboardWatchdog.armedSeq = clipboard.runSeq;
+    clipboardWatchdog.interval = root.clipboardStartWindow;
+    clipboardWatchdog.restart();
+    root.clipboardBusy = true;
+    clipboard.running = true;
+  }
+
+  // Copy `text` to the clipboard over stdin (the `clipboard` Process), never in
+  // an argv — the old `printf ... "$1"` form leaked the text into
+  // /proc/<pid>/cmdline. This is the single clipboard mechanism both the card's
+  // Copy action (SpotCard) and the collapsed cluster's phone cell (SpotCard)
+  // share; the "Copied" feedback stays with each caller's own transient state.
   function copyToClipboard(text) {
-    Quickshell.execDetached(["sh", "-c", "printf '%s' \"$1\" | wl-copy 2>/dev/null || printf '%s' \"$1\" | xclip -selection clipboard 2>/dev/null", "_", text]);
+    var payload = String(text == null ? "" : text);
+    if (root.clipboardBusy) {
+      // A copy landed mid-flight: stash it for onExited to start (last wins).
+      clipboard.pendingText = payload;
+      return;
+    }
+    startClipboardRun(payload);
   }
 
   // Shared body for the nine filter/sort/scope controls below: a change to any

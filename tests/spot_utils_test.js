@@ -9,6 +9,22 @@ const { assert, report } = require("./_assert.js");
 assert("MAX_STATE_BYTES is 4 MiB", M.MAX_STATE_BYTES === 4194304);
 assert("MAX_STATE_BYTES > 2 MiB", M.MAX_STATE_BYTES > 2 * 1024 * 1024);
 
+// ----- utf8Length -----
+// The clipboard `head -c $n` byte count must match what QProcess writes for the
+// same QString (UTF-8): ASCII 1, two-byte é, four-byte emoji, and a lone
+// surrogate (replacement, 3). Surrogate pairs are one code point, four bytes.
+assert("utf8Length empty", M.utf8Length("") === 0);
+assert("utf8Length null", M.utf8Length(null) === 0);
+assert("utf8Length ASCII", M.utf8Length("abc") === 3);
+assert("utf8Length é", M.utf8Length("café") === 5);
+assert("utf8Length emoji", M.utf8Length("\u{1F363}") === 4);
+assert("utf8Length surrogate pair one codepoint", M.utf8Length("\uD83C\uDF63") === 4);
+assert("utf8Length lone high surrogate", M.utf8Length("\uD83C") === 3);
+assert("utf8Length 3-byte BMP char", M.utf8Length("\u20AC") === 3);
+assert("utf8Length lone low surrogate", M.utf8Length("\uDC00") === 3);
+assert("utf8Length mixed", M.utf8Length("café \u{1F363} sushi") === 16);
+assert("utf8Length number coerced", M.utf8Length(123) === 3);
+
 // ----- spotKind -----
 assert("spotKind omakase", M.spotKind({courses:"20",price:"$550"}) === "omakase");
 assert("spotKind discount", M.spotKind({discount_window:"8pm",discount:"50%"}) === "discount");
